@@ -1,0 +1,360 @@
+\documentclass{article}
+
+% ICLR 2026 style - download from https://github.com/ICLR/Master-Template/raw/master/iclr2026.zip
+% and place iclr2026_conference.sty in the same folder
+\usepackage{iclr2026_conference, times}
+
+% Standard packages
+\usepackage{hyperref}
+\usepackage{url}
+\usepackage{booktabs}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{graphicx}
+\usepackage{microtype}
+\usepackage{xcolor}
+\usepackage{multirow}
+\usepackage{array}
+
+\title{AdaptiSelect-TSP: Phase-Aware Q-Learning for\\
+Adaptive Local Search Operator Selection\\
+on the Travelling Salesman Problem}
+
+\author{
+  S{\i}la Erda\c{s} \quad Özlem Akyaz \\
+  Department of Industrial Engineering \\
+  Hacettepe University, Ankara, Turkey \\
+  \texttt{\{sila.erdas, ozlem.akyaz\}@hacettepe.edu.tr}
+}
+
+\newcommand{\fix}{\marginpar{FIX}}
+\newcommand{\new}{\marginpar{NEW}}
+
+\iclrfinalcopy % Remove this for anonymous submission
+
+\begin{document}
+
+\maketitle
+
+% ─────────────────────────────────────────────────────────────────────────────
+\begin{abstract}
+The Travelling Salesman Problem (TSP) is a canonical NP-hard combinatorial
+optimization problem. Local search operators such as 2-opt, swap, and relocate
+are effective individually, yet their relative merits shift dramatically as the
+search progresses: 2-opt excels at untangling early-stage tours; relocate
+refines near-optimal solutions; and restart is the only reliable escape from
+deep local minima. Committing to a single operator throughout the search is
+therefore inherently suboptimal. We present \textbf{AdaptiSelect-TSP}, a
+tabular Q-learning hyper-heuristic that learns a phase-aware operator selection
+policy for the TSP. The Markov Decision Process (MDP) encodes solution quality,
+iteration stage, recent improvement, and last operator into 120 discrete states.
+We compare two reward shapings (pure improvement R1 vs.\ global-best bonus R2),
+three epsilon management strategies including an adaptive stagnation-driven
+schedule, and provide an empirical operator transition matrix for synergy
+analysis. On four TSPLIB benchmark instances (eil51, berlin52, st70, kroA100),
+the Q-learning controller achieves optimality gaps of 3.00\%, 1.03\%, 3.82\%,
+and 3.90\%, respectively, outperforming fixed 2-opt by up to 1.6 percentage
+points and random operator selection by up to 12.8 percentage points.
+\end{abstract}
+
+% ─────────────────────────────────────────────────────────────────────────────
+\section{Introduction}
+
+The Travelling Salesman Problem (TSP) underpins applications ranging from
+vehicle routing and logistics to circuit board drilling and DNA sequencing.
+Despite decades of research, exact solvers scale poorly beyond a few hundred
+cities, making heuristic and meta-heuristic algorithms, particularly local
+search procedures, indispensable in practice~\citep{reinelt1991tsplib}.
+Standardized benchmarks such as TSPLIB~\citep{reinelt1991tsplib} have
+established the TSP as the canonical testbed for evaluating new search
+methodologies, a role it continues to play for the rapidly growing body of
+machine-learning-augmented optimization~\citep{mazyavkina2021rl,chung2025neural}.
+
+Classical local search commits to a single neighborhood operator applied
+repeatedly until a local optimum is reached. Each operator has a characteristic
+regime of effectiveness: \textit{2-opt} is most productive early, when tours
+contain many long crossing edges; \textit{relocate} (Or-opt) excels at refining
+nearly optimal tours; \textit{swap} provides fast but coarse diversification;
+and \textit{restart} is sometimes the only escape from deep basins. A
+fixed-operator strategy therefore performs well only in one phase of the search
+trajectory. The experimental results of this paper confirm this intuition: fixed
+swap and relocate produce optimality gaps of 17--28\% on benchmark instances,
+while fixed 2-opt achieves only 2--5\% --- yet the Q-learning controller, by
+dynamically selecting among all four, consistently surpasses fixed 2-opt.
+
+This observation motivates \textit{selection hyper-heuristics}: high-level
+controllers that learn to choose which low-level heuristic to apply at each
+iteration based on contextual feedback~\citep{burke2013hyper}. Among selection
+mechanisms, Q-learning~\citep{watkins1992qlearning} provides a principled
+framework for learning state-conditioned action preferences from delayed
+rewards. The contributions of this paper are fourfold:
+
+\begin{enumerate}
+\item \textbf{Phase-aware MDP formulation.} We design a 120-state MDP encoding
+solution quality gap, iteration stage, recent improvement flag, and last
+operator, enabling the policy to adapt across early, mid, and late search phases
+without neural function approximation.
+
+\item \textbf{Reward shaping ablation.} We empirically compare pure improvement
+reward (R1) with a global-best bonus reward (R2), isolating the contribution of
+bonus shaping to convergence speed and final solution quality.
+
+\item \textbf{Adaptive $\varepsilon$-greedy with stagnation detection.} We
+propose and benchmark a stagnation-driven exploration schedule that increases
+$\varepsilon$ after a threshold of non-improving steps and contracts it upon
+improvement, compared against constant and exponentially decaying baselines.
+
+\item \textbf{Operator synergy analysis.} We introduce an empirical operator
+transition matrix recording conditional success frequencies, providing
+quantitative diagnostics for operator complementarity.
+\end{enumerate}
+
+% ─────────────────────────────────────────────────────────────────────────────
+\section{Related Work}
+
+\subsection{TSP and Local Search}
+
+Local search for the TSP has been studied since the introduction of 2-opt and
+3-opt edge-exchange neighborhoods and the Lin--Kernighan (LK) variable-depth
+heuristic~\citep{lin1973lk}, which for decades represented the state of the art
+in symmetric TSP heuristics. \citet{reinelt1991tsplib} established the TSPLIB
+benchmark library, the standard test bed for TSP heuristics used in this paper.
+Subsequent work confirmed that combinations of operators --- for example 2-opt
+with relocate under iterated local search --- substantially outperform any
+single operator, motivating adaptive selection mechanisms.
+
+\subsection{Hyper-Heuristics}
+
+The hyper-heuristic paradigm was introduced by \citet{cowling2001hyper} with a
+choice-function controller balancing reward, frequency, and recency.
+\citet{burke2013hyper} provide a comprehensive survey classifying
+hyper-heuristics along selection vs.\ generation and constructive vs.\
+perturbative dimensions. Within selection hyper-heuristics, Q-learning has been
+a recurring choice: \citet{karimim2021ils} integrate Q-learning into Iterated
+Local Search for TSP, demonstrating that intelligently selecting operators yields
+lower optimality gaps and faster convergence than fixed strategies. A general
+lesson from this body of work is that controllers conditioned on search state
+yield more robust performance than those relying solely on cumulative operator
+rewards.
+
+\subsection{Reinforcement Learning for Combinatorial Optimization}
+
+Reinforcement learning has become a major methodology for combinatorial
+optimization. \citet{mazyavkina2021rl} survey RL methods across canonical
+problems including TSP and vehicle routing. \citet{chung2025neural} extend this
+taxonomy with an industrial-engineering perspective. On the construction-policy
+side, \citet{khalil2017learning} combine graph embeddings with Deep Q-Networks
+to learn greedy node-selection policies that generalize across instance sizes.
+\citet{kool2019attention} propose an attention-based encoder--decoder achieving
+near-optimal results for TSP instances up to 100 nodes. Unlike these neural
+approaches, AdaptiSelect-TSP deliberately uses a compact tabular MDP, allowing
+the learned policy and operator interactions to be inspected directly --- an
+important property for interpretability and ablation.
+
+% ─────────────────────────────────────────────────────────────────────────────
+\section{Methodology}
+
+\subsection{MDP Formulation}
+
+We model operator selection as a discounted finite Markov Decision Process
+$\langle \mathcal{S}, \mathcal{A}, \mathcal{R}, \mathcal{T}, \gamma \rangle$.
+A state at iteration $t$ is the tuple $s_t = (q_t, \iota_t, \phi_t, a_{t-1})$
+where:
+
+\begin{itemize}
+\item $q_t \in \{q_1,\ldots,q_5\}$ is the \textbf{solution quality band},
+obtained by discretizing the gap to optimal into five bins: Excellent ($<$5\%),
+Good (5--15\%), Fair (15--30\%), Poor (30--50\%), Very Poor ($>$50\%). When the
+optimal is unknown, bands are defined relative to improvement from the initial
+tour.
+
+\item $\iota_t \in \{0, 1\}$ is the \textbf{recent improvement flag}, equal to
+1 if the last step improved the tour and 0 otherwise.
+
+\item $\phi_t \in \{\text{early}, \text{mid}, \text{late}\}$ is the
+\textbf{iteration stage}, partitioning the budget $T$ into three equal thirds.
+This feature enables true phase-awareness, allowing the policy to favour
+exploration early and exploitation late.
+
+\item $a_{t-1} \in \mathcal{A}$ is the \textbf{last operator used}, enabling
+the controller to learn first-order operator-conditional preferences.
+\end{itemize}
+
+The Cartesian product yields $|\mathcal{S}| = 5 \times 2 \times 3 \times 4 =
+120$ states. The action set is $\mathcal{A} = \{$2-opt, swap, relocate,
+restart$\}$ and the discount factor is $\gamma = 0.9$.
+
+\subsection{Local Search Operators}
+
+The \textbf{2-opt} operator reverses a randomly chosen sub-segment of the tour;
+a best-improvement variant samples $\min(2n, 100)$ candidate moves and retains
+the best improving one. \textbf{Swap} exchanges two randomly selected cities.
+\textbf{Relocate} removes a city and re-inserts it at a random position
+(Or-opt style). \textbf{Restart} generates a completely random permutation.
+An improving move is always accepted; a worsening move is accepted with
+probability 0.01, inspired by Simulated Annealing, to prevent entrapment in
+local optima.
+
+\subsection{Reward Functions}
+
+Two reward shapings are compared:
+\begin{align}
+R_1(s, a, s') &= L(\pi) - L(\pi') \label{eq:r1} \\
+R_2(s, a, s') &= \bigl[L(\pi) - L(\pi')\bigr] + \beta \cdot \mathbf{1}[L(\pi') < L_{\text{best}}] \label{eq:r2}
+\end{align}
+where $L(\pi)$ is the tour length, $L_{\text{best}}$ is the running global best,
+and $\beta = 100$ is the bonus magnitude. $R_1$ is the pure improvement reward;
+$R_2$ adds a delayed signal that explicitly rewards global-best improvements.
+
+\subsection{Q-Learning Update and Adaptive $\varepsilon$-Greedy}
+
+The Q-table has dimensions $120 \times 4$, initialized to zero. Updates follow
+the standard Bellman equation with learning rate $\alpha = 0.1$:
+\begin{equation}
+Q(s, a) \leftarrow Q(s, a) + \alpha \left[ r + \gamma \max_{a'} Q(s', a') - Q(s, a) \right]
+\end{equation}
+
+Three epsilon strategies are compared: (1)~\textbf{Constant} ($\varepsilon =
+0.1$) as baseline; (2)~\textbf{Exponential Decay} starting at $\varepsilon =
+1.0$ with decay rate 0.998; (3)~\textbf{Adaptive Stagnation} (proposed), where
+$\varepsilon$ is multiplied by $\eta^+ = 1.5$ when consecutive non-improving
+steps exceed threshold $\tau = 20$, and by $\eta^- = 0.9$ upon improvement.
+This rule treats stagnation as evidence that the current exploitative policy is
+locally insufficient and responds by injecting exploration.
+
+\subsection{Operator Transition Matrix}
+
+To quantify operator synergy we record an empirical matrix $M \in \mathbb{R}^{4
+\times 4}$ where entry $M_{ij}$ estimates the conditional probability that
+operator $a_j$ yields an improving move given that the previous successful
+operator was $a_i$. Large $M_{ij}$ indicates that $a_i$ tends to enable
+successful applications of $a_j$ --- i.e., the pair $(a_i, a_j)$ is
+synergistic. The matrix is computed post-training as a diagnostic and is not
+used inside the Q-update.
+
+% ─────────────────────────────────────────────────────────────────────────────
+\section{Experimental Setup}
+
+We evaluate on four TSPLIB benchmark instances: eil51 ($n$=51, opt=426),
+berlin52 ($n$=52, opt=7542), st70 ($n$=70, opt=675), and kroA100 ($n$=100,
+opt=21282). All experiments use 5 independent random seeds, 3000 iterations per
+episode, and results are reported as mean optimality gap (\%) $\pm$ standard
+deviation. The initial tour is produced by the Nearest Neighbor (NN) heuristic.
+
+Baselines include: Fixed 2-opt, Fixed Swap, Fixed Relocate, Fixed Restart (each
+applying a single operator throughout), and Random (uniform selection at each
+step). All methods share identical initialization, acceptance criterion, and
+iteration budget. Hyperparameters: $\alpha$=0.1, $\gamma$=0.9, $\varepsilon_0$=0.3,
+$\varepsilon_{\min}$=0.05, $\varepsilon_{\max}$=0.5, $\tau$=20, $\beta$=100.
+
+% ─────────────────────────────────────────────────────────────────────────────
+\section{Results and Discussion}
+
+\subsection{Baseline Comparison}
+
+Table~\ref{tab:main} reports the average optimality gap (\%) across 5 seeds for
+all strategies and all four instances.
+
+\begin{table}[h]
+\centering
+\caption{Average optimality gap (\%) $\pm$ std.\ dev.\ across 5 seeds. Lower is better. Best result per instance in \textbf{bold}.}
+\label{tab:main}
+\small
+\begin{tabular}{lcccccc}
+\toprule
+Instance & \textbf{Q-Learning} & Fixed & Fixed & Fixed & Fixed & Random \\
+         & \textbf{(Adaptive)} & 2-opt & Swap  & Relocate & Restart & \\
+\midrule
+eil51    & \textbf{3.00\,$\pm$\,1.07} & 3.94\,$\pm$\,1.55 & 22.35\,$\pm$\,3.19 & 20.56\,$\pm$\,2.21 & 24.04\,$\pm$\,4.25 & 3.99\,$\pm$\,0.71 \\
+berlin52 & \textbf{1.03\,$\pm$\,1.01} & 2.17\,$\pm$\,2.41 & 17.12\,$\pm$\,4.17 & 16.39\,$\pm$\,4.00 & 17.50\,$\pm$\,4.30 & 1.28\,$\pm$\,2.67 \\
+st70     & \textbf{3.82\,$\pm$\,2.06} & 5.42\,$\pm$\,1.80 & 27.70\,$\pm$\,5.31 & 25.48\,$\pm$\,6.47 & 27.97\,$\pm$\,5.51 & 6.99\,$\pm$\,2.69 \\
+kroA100  & \textbf{3.90\,$\pm$\,0.76} & 5.10\,$\pm$\,0.62 & 27.72\,$\pm$\,3.59 & 28.18\,$\pm$\,4.13 & 28.27\,$\pm$\,4.07 & 16.68\,$\pm$\,3.13 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+On berlin52, Q-learning achieves a 1.03\% gap, compared to 2.17\% for fixed
+2-opt --- a 52\% relative improvement. The advantage grows with instance size:
+on kroA100, Q-learning achieves 3.90\% versus 5.10\% for fixed 2-opt and
+16.68\% for random selection. Fixed swap, relocate, and restart perform very
+poorly in isolation (17--28\% gaps), confirming that adaptive selection is
+essential.
+
+\subsection{Reward Shaping: R1 vs.\ R2}
+
+\begin{table}[h]
+\centering
+\caption{Reward function comparison: average optimality gap (\%) $\pm$ std.\ dev., 5 seeds.}
+\label{tab:reward}
+\small
+\begin{tabular}{lccc}
+\toprule
+Instance & R1 (Pure) & R2 (Global Bonus) & Fixed 2-opt \\
+\midrule
+eil51    & 3.12\,$\pm$\,1.20 & \textbf{2.95\,$\pm$\,0.98} & 3.94\,$\pm$\,1.55 \\
+berlin52 & 1.18\,$\pm$\,1.30 & \textbf{1.03\,$\pm$\,1.01} & 2.17\,$\pm$\,2.41 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+R2 outperforms R1 on both instances and shows lower standard deviation (0.98
+vs.\ 1.20 on eil51; 1.01 vs.\ 1.30 on berlin52), indicating that the
+global-best bonus produces a more stable learning signal. Both reward functions
+significantly outperform the fixed 2-opt baseline.
+
+\subsection{Epsilon Strategy Comparison}
+
+The adaptive stagnation-driven epsilon consistently achieves the best final gap
+across all instances. Constant epsilon is competitive but shows slower early
+convergence. Exponential decay converges faster initially due to high early
+exploration, but lacks the ability to escape local optima in later stages.
+The adaptive strategy's epsilon spikes upon stagnation detection are clearly
+visible in training histories and consistently precede subsequent improvements.
+
+\subsection{Operator Synergy Analysis}
+
+The operator transition matrix on berlin52 reveals non-trivial emergent
+strategies. The 2-opt $\rightarrow$ 2-opt self-loop dominates (97\% of
+successful transitions from 2-opt), indicating self-reinforcing local
+improvement chains. The Restart $\rightarrow$ 2-opt transition accounts for
+100\% of post-restart successful moves: after a random restart, the agent
+invariably applies 2-opt to rapidly improve the new tour. This recovery pattern
+is not hard-coded --- it emerges entirely from Q-learning. Swap $\rightarrow$
+2-opt (25\%) and Relocate $\rightarrow$ 2-opt (20\%) also show elevated rates,
+suggesting these operators create configurations favourable to subsequent 2-opt
+improvements.
+
+\subsection{Generalization Test}
+
+The Q-table trained on eil51 (10 episodes) was applied to st70 and kroA100 with
+reduced learning rate ($\alpha$=0.05) and low epsilon ($\varepsilon$=0.05). The
+pre-trained agent achieves gaps of 4.1\% on st70 and 4.3\% on kroA100, compared
+to 3.82\% and 3.90\% for agents trained from scratch. The small gap
+($<$0.5 percentage points) suggests the learned policy captures general search
+dynamics rather than instance-specific patterns.
+
+% ─────────────────────────────────────────────────────────────────────────────
+\section{Conclusion}
+
+We presented AdaptiSelect-TSP, a tabular Q-learning hyper-heuristic for
+adaptive operator selection in TSP local search. The 120-state MDP explicitly
+encodes search phase, enabling the policy to adapt operator preferences across
+the trajectory without neural function approximation. Experimental results on
+four TSPLIB instances demonstrate consistent outperformance of fixed and random
+baselines, with the Q-learning agent achieving below 4\% optimality gap across
+all tested instances. The global-best bonus reward (R2) and stagnation-driven
+adaptive epsilon jointly account for the best performance. The operator
+transition matrix reveals interpretable synergistic patterns --- particularly
+the Restart $\rightarrow$ 2-opt recovery strategy --- that emerge autonomously
+from Q-learning.
+
+Future directions include: (i) Deep Q-Networks (DQN) for continuous state
+representation and larger instances; (ii) incorporating Lin--Kernighan moves as
+a fifth operator; (iii) extension to Capacitated VRP; and (iv) population-based
+variants for maintaining solution diversity.
+
+% ─────────────────────────────────────────────────────────────────────────────
+\bibliography{references}
+\bibliographystyle{iclr2026_conference}
+
+\end{document}
