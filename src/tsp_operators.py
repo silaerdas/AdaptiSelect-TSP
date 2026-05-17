@@ -47,14 +47,22 @@ def swap_operator(tour, dist_matrix):
 
 
 def relocate_operator(tour, dist_matrix):
-    """Remove a city and re-insert it at a different random position."""
+    """Remove a city and re-insert it at a different random position.
+
+    Fix (M3): After pop(i), valid positions are 0..n-1. We pick
+    j in [0, n-2] and shift by 1 if j >= i so j never equals i,
+    guaranteeing the city moves to a genuinely different location.
+    """
     n = len(tour)
+    if n < 3:
+        return tour[:]
     new_tour = tour[:]
     i = random.randint(0, n - 1)
     city = new_tour.pop(i)
-    j = random.randint(0, len(new_tour))
-    if j == i:
-        j = (j + 1) % len(new_tour)
+    # Pick from n-1 positions that are NOT i
+    j = random.randint(0, n - 2)
+    if j >= i:
+        j += 1           # shift up to skip index i
     new_tour.insert(j, city)
     return new_tour
 

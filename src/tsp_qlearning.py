@@ -149,6 +149,8 @@ class QLearningAgent:
         self.epsilon_strategy = epsilon_strategy or ConstantEpsilon(0.1)
         self.reward_fn = reward_fn or reward_pure_improvement
         self.reward_name = reward_name
+        # H1: default state so select_action() is safe before run_episode()
+        self.state = 0
 
     def select_action(self):
         """Epsilon-greedy action selection."""
@@ -206,13 +208,15 @@ class QLearningAgent:
             # Compute reward
             reward = self.reward_fn(current_length, new_length, global_best_length)
 
-            # Accept move (always accept — let RL learn)
+            # Improved flag for RL state and epsilon update
             improved_flag = 1 if new_length < current_length else 0
 
-            # Track transitions after successful moves
-            if improved_flag and last_successful_op is not None:
+            # H2: Track transitions only for non-restart successful moves.
+            # Restart is a perturbation, not a "synergistic" move; including
+            # it distorts the operator-synergy analysis.
+            if improved_flag and last_successful_op is not None and action != 3:
                 transition_counts[last_successful_op, action] += 1
-            if improved_flag:
+            if improved_flag and action != 3:
                 last_successful_op = action
 
             if action == 3:
@@ -223,11 +227,16 @@ class QLearningAgent:
                 global_best_length = new_length
                 best_tour = new_tour[:]
 
-            # Accept improving moves; for worsening, accept with small probability
-            if new_length < current_length:
+            # M2: Restart always replaces current tour (it is a full perturbation).
+            # For all other operators accept improving moves; accept worsening
+            # with small SA-like probability to escape local optima.
+            if action == 3:
+                tour = new_tour          # restart: always accept new random tour
+                current_length = new_length
+            elif new_length < current_length:
                 tour = new_tour
                 current_length = new_length
-            elif random.random() < 0.01:  # small probability to accept worse
+            elif random.random() < 0.01:  # small SA-like accept of worse move
                 tour = new_tour
                 current_length = new_length
 

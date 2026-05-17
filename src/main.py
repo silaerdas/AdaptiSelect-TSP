@@ -15,7 +15,6 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 import random
 import os
-import sys
 import time
 
 from tsp_data import get_instance, tour_length, OPTIMAL
@@ -203,7 +202,7 @@ def run_epsilon_comparison():
             ("Adaptive (Stagnation)", AdaptiveEpsilon()),
         ]
 
-        for ename, eps_factory in eps_strategies:
+        for ename in ["Constant eps=0.1", "Exponential Decay", "Adaptive (Stagnation)"]:
             gaps = []
             histories = []
             restart_counts = []
@@ -273,7 +272,9 @@ def plot_convergence(all_results):
 
 
 def plot_transition_heatmap(all_results):
-    """Plot operator transition heatmaps for Q-Learning results."""
+    """Plot operator transition heatmaps for Q-Learning results.
+    E4: Also prints the strongest synergy pair found.
+    """
     for inst_name, strategies in all_results.items():
         ql_data = strategies.get('Q-Learning (Adaptive)')
         if ql_data is None or ql_data.get('transitions') is None:
@@ -282,12 +283,20 @@ def plot_transition_heatmap(all_results):
         transitions = ql_data['transitions']
         # Normalize rows to get probabilities
         row_sums = transitions.sum(axis=1, keepdims=True)
-        row_sums[row_sums == 0] = 1  # avoid division by zero
+        row_sums[row_sums == 0] = 1
         trans_probs = transitions / row_sums
+
+        # E4: Find & print strongest synergy pair (exclude self-transitions)
+        mask = trans_probs.copy()
+        np.fill_diagonal(mask, 0)
+        if mask.max() > 0:
+            fr, to = np.unravel_index(np.argmax(mask), mask.shape)
+            print(f"  [{inst_name}] Strongest synergy: "
+                  f"{OPERATOR_NAMES[fr]} → {OPERATOR_NAMES[to]} "
+                  f"(prob={mask[fr, to]:.2f})")
 
         fig, axes = plt.subplots(1, 2, figsize=(14, 5))
 
-        # Raw counts
         sns.heatmap(transitions, annot=True, fmt='.0f', cmap='YlOrRd',
                     xticklabels=OPERATOR_NAMES, yticklabels=OPERATOR_NAMES,
                     ax=axes[0])
@@ -295,7 +304,6 @@ def plot_transition_heatmap(all_results):
         axes[0].set_xlabel('Next Operator')
         axes[0].set_ylabel('Previous Operator')
 
-        # Probabilities
         sns.heatmap(trans_probs, annot=True, fmt='.2f', cmap='YlGnBu',
                     xticklabels=OPERATOR_NAMES, yticklabels=OPERATOR_NAMES,
                     ax=axes[1])
@@ -403,11 +411,13 @@ def plot_best_tour(all_results):
 
 
 def plot_summary_table(all_results):
-    """Create a summary comparison table as an image."""
-    fig, ax = plt.subplots(figsize=(14, len(ALL_INSTANCES) * 2.5 + 1))
+    """Create a summary comparison table as an image.
+    H4: Use suptitle + subplots_adjust to prevent title from being clipped.
+    """
+    n_rows = len(ALL_INSTANCES)
+    fig, ax = plt.subplots(figsize=(15, n_rows * 2.5 + 2))
     ax.axis('off')
 
-    # Build table data
     strategies_list = ['Q-Learning (Adaptive)', 'Fixed 2-opt', 'Fixed swap',
                        'Fixed relocate', 'Fixed restart', 'Random']
     col_labels = ['Instance'] + strategies_list
@@ -427,21 +437,21 @@ def plot_summary_table(all_results):
                      loc='center', cellLoc='center')
     table.auto_set_font_size(False)
     table.set_fontsize(9)
-    table.scale(1.0, 2.0)
+    table.scale(1.0, 2.2)
 
-    # Color the header
     for j in range(len(col_labels)):
         table[0, j].set_facecolor('#4472C4')
         table[0, j].set_text_props(color='white', fontweight='bold')
 
-    # Highlight Q-Learning column
     for i in range(len(table_data)):
         table[i + 1, 1].set_facecolor('#E2EFDA')
 
-    ax.set_title('Summary: Average Gap to Optimal (%)', fontsize=14,
-                 fontweight='bold', pad=20)
-    plt.tight_layout()
-    plt.savefig(os.path.join(RESULTS_DIR, 'summary_table.png'), dpi=150, bbox_inches='tight')
+    # H4: suptitle + adjust so title is never clipped during save
+    fig.suptitle('Summary: Average Gap to Optimal (%)', fontsize=14,
+                 fontweight='bold', y=0.98)
+    plt.subplots_adjust(top=0.92)
+    plt.savefig(os.path.join(RESULTS_DIR, 'summary_table.png'), dpi=150,
+                bbox_inches='tight')
     plt.close()
     print(f"  Saved: summary_table.png")
 
@@ -479,58 +489,210 @@ def plot_operator_distribution(all_results):
 # ============================================================
 
 def run_generalization_test(all_results):
-    """Train on small instances, test on larger ones."""
+    """Train on BOTH small instances (eil51 + berlin52), test on larger ones.
+    M5 fix: project spec says 'smaller instances' (plural); berlin52 added.
+    Returns gen_results dict for plotting.
+    """
     print("\n" + "=" * 70)
     print("EXPERIMENT 4: Generalization Test (Train on small -> Test on large)")
     print("=" * 70)
 
-    # Train a Q-table on eil51
-    _, dist_train, opt_train = get_instance('eil51')
-    agent = QLearningAgent(
-        alpha=0.1, gamma=0.9,
-        epsilon_strategy=AdaptiveEpsilon(),
-        reward_fn=reward_pure_improvement,
-    )
-    # Train over multiple episodes
-    for ep in range(10):
-        agent.run_episode(dist_train, opt_train, max_iterations=MAX_ITERATIONS,
-                          seed=SEED_BASE + ep)
-    trained_q_table = agent.q_table.copy()
-    print(f"  Trained Q-table on eil51 ({10} episodes)")
+    # ---- Train on eil51 + berlin52 (M5: both training instances) ----
+    combined_q = None
+    for train_name in TRAIN_INSTANCES:
+        _, dist_train, opt_train = get_instance(train_name)
+        agent = QLearningAgent(
+            alpha=0.1, gamma=0.9,
+            epsilon_strategy=AdaptiveEpsilon(),
+            reward_fn=reward_pure_improvement,
+        )
+        if combined_q is not None:            # warm-start from previous training
+            agent.q_table = combined_q.copy()
+        for ep in range(10):
+            agent.run_episode(dist_train, opt_train,
+                              max_iterations=MAX_ITERATIONS,
+                              seed=SEED_BASE + ep)
+        combined_q = agent.q_table.copy()
+        print(f"  Trained Q-table on {train_name} (10 episodes)")
 
-    # Test on larger instances with the trained Q-table
+    # ---- Test on larger instances ----
+    gen_results = {}      # {test_name: {'pretrained': [...], 'fresh': [...]}}
     for test_name in TEST_INSTANCES:
         _, dist_test, opt_test = get_instance(test_name)
-        gaps_pretrained = []
-        gaps_fresh = []
+        gaps_pretrained, gaps_fresh = [], []
 
         for run in range(NUM_RUNS):
-            # Pre-trained agent
             agent_pre = QLearningAgent(
                 alpha=0.05, gamma=0.9,
                 epsilon_strategy=ConstantEpsilon(0.05),
                 reward_fn=reward_pure_improvement,
             )
-            agent_pre.q_table = trained_q_table.copy()
+            agent_pre.q_table = combined_q.copy()
             result_pre = agent_pre.run_episode(dist_test, opt_test,
-                                                max_iterations=MAX_ITERATIONS,
-                                                seed=SEED_BASE + run)
+                                               max_iterations=MAX_ITERATIONS,
+                                               seed=SEED_BASE + run)
             gaps_pretrained.append(result_pre['gap'])
 
-            # Fresh agent
             agent_fresh = QLearningAgent(
                 alpha=0.1, gamma=0.9,
                 epsilon_strategy=AdaptiveEpsilon(),
                 reward_fn=reward_pure_improvement,
             )
             result_fresh = agent_fresh.run_episode(dist_test, opt_test,
-                                                    max_iterations=MAX_ITERATIONS,
-                                                    seed=SEED_BASE + run)
+                                                   max_iterations=MAX_ITERATIONS,
+                                                   seed=SEED_BASE + run)
             gaps_fresh.append(result_fresh['gap'])
 
+        gen_results[test_name] = {
+            'pretrained': gaps_pretrained,
+            'fresh': gaps_fresh,
+        }
         print(f"\n  {test_name}:")
         print(f"    Pre-trained Q-table: {np.mean(gaps_pretrained):.2f}% ± {np.std(gaps_pretrained):.2f}")
         print(f"    Fresh Q-Learning:    {np.mean(gaps_fresh):.2f}% ± {np.std(gaps_fresh):.2f}")
+
+    return gen_results
+
+
+# ============================================================
+# NEW Visualization Functions (E1, E2, E3, E5)
+# ============================================================
+
+def plot_reward_bar_comparison(reward_results):
+    """E1: Bar chart — avg gap for R1 vs R2 per training instance."""
+    fig, ax = plt.subplots(figsize=(8, 5))
+    x = np.arange(len(TRAIN_INSTANCES))
+    width = 0.35
+    colors = ['#4472C4', '#ED7D31']
+    for idx, rname in enumerate(['R1 (Pure)', 'R2 (Global Bonus)']):
+        means = []
+        stds = []
+        for inst in TRAIN_INSTANCES:
+            key = f"{inst}_{rname}"
+            d = reward_results.get(key, {})
+            means.append(d.get('avg_gap', 0))
+            stds.append(d.get('std_gap', 0))
+        bars = ax.bar(x + idx * width, means, width, yerr=stds,
+                      label=rname, color=colors[idx],
+                      capsize=5, edgecolor='black', linewidth=0.5)
+    ax.set_xticks(x + width / 2)
+    ax.set_xticklabels(TRAIN_INSTANCES)
+    ax.set_xlabel('Instance', fontsize=12)
+    ax.set_ylabel('Avg Gap to Optimal (%)', fontsize=12)
+    ax.set_title('Reward Shaping Comparison: R1 vs R2', fontsize=14, fontweight='bold')
+    ax.legend(fontsize=10)
+    ax.grid(True, alpha=0.3, axis='y')
+    plt.tight_layout()
+    plt.savefig(os.path.join(RESULTS_DIR, 'reward_bar_comparison.png'), dpi=150)
+    plt.close()
+    print(f"  Saved: reward_bar_comparison.png")
+
+
+def plot_epsilon_restart_bar(epsilon_results):
+    """E2: Bar chart — avg restart count by epsilon strategy per instance."""
+    strategies = ['Constant eps=0.1', 'Exponential Decay', 'Adaptive (Stagnation)']
+    fig, axes = plt.subplots(1, len(TRAIN_INSTANCES),
+                             figsize=(6 * len(TRAIN_INSTANCES), 5), sharey=False)
+    if len(TRAIN_INSTANCES) == 1:
+        axes = [axes]
+    colors = ['#A5A5A5', '#4472C4', '#ED7D31']
+    for ax, inst_name in zip(axes, TRAIN_INSTANCES):
+        means = []
+        for s in strategies:
+            key = f"{inst_name}_{s}"
+            means.append(epsilon_results.get(key, {}).get('avg_restarts', 0))
+        bars = ax.bar(strategies, means, color=colors,
+                      edgecolor='black', linewidth=0.5)
+        for bar, m in zip(bars, means):
+            ax.text(bar.get_x() + bar.get_width() / 2,
+                    bar.get_height() + 0.5,
+                    f'{m:.1f}', ha='center', va='bottom', fontsize=9)
+        ax.set_title(f'Restart Count — {inst_name}', fontweight='bold')
+        ax.set_ylabel('Avg Restarts')
+        ax.set_xticks(range(len(strategies)))          # fix FixedLocator warning
+        ax.set_xticklabels(strategies, rotation=15, ha='right', fontsize=9)
+        ax.grid(True, alpha=0.3, axis='y')
+    plt.suptitle('Epsilon Strategy: Average Restart Count', fontsize=13,
+                 fontweight='bold')
+    plt.tight_layout()
+    plt.savefig(os.path.join(RESULTS_DIR, 'epsilon_restart_bar.png'), dpi=150)
+    plt.close()
+    print(f"  Saved: epsilon_restart_bar.png")
+
+
+def plot_qtable_heatmap(all_results):
+    """E3: Q-Table heatmap: aggregate Q-values by quality_band vs operator."""
+    from tsp_qlearning import NUM_QUALITY_BANDS, NUM_STAGES, NUM_OPERATORS, encode_state
+    QUALITY_LABELS = ['<5%', '5-15%', '15-30%', '30-50%', '>50%']
+
+    # Re-run one episode to get a trained agent's Q-table for each train instance
+    for inst_name in TRAIN_INSTANCES:
+        _, dist_matrix, optimal = get_instance(inst_name)
+        agent = QLearningAgent(
+            alpha=0.1, gamma=0.9,
+            epsilon_strategy=AdaptiveEpsilon(),
+            reward_fn=reward_pure_improvement,
+        )
+        for ep in range(5):
+            agent.run_episode(dist_matrix, optimal,
+                              max_iterations=MAX_ITERATIONS,
+                              seed=SEED_BASE + ep)
+
+        # Aggregate Q-values: average over improved=[0,1], stage=[0,1,2], last_op=[0..3]
+        agg = np.zeros((NUM_QUALITY_BANDS, NUM_OPERATORS))
+        counts = np.zeros((NUM_QUALITY_BANDS, NUM_OPERATORS))
+        for qb in range(NUM_QUALITY_BANDS):
+            for imp in range(2):
+                for stg in range(NUM_STAGES):
+                    for lop in range(NUM_OPERATORS):
+                        s = encode_state(qb, imp, stg, lop)
+                        agg[qb] += agent.q_table[s]
+                        counts[qb] += 1
+        avg_q = agg / np.maximum(counts, 1)
+
+        fig, ax = plt.subplots(figsize=(8, 5))
+        sns.heatmap(avg_q, annot=True, fmt='.1f', cmap='RdYlGn',
+                    xticklabels=OPERATOR_NAMES,
+                    yticklabels=QUALITY_LABELS, ax=ax)
+        ax.set_xlabel('Operator', fontsize=12)
+        ax.set_ylabel('Solution Quality Band (gap to optimal)', fontsize=12)
+        ax.set_title(f'Avg Q-Values by Quality Band — {inst_name}',
+                     fontsize=13, fontweight='bold')
+        plt.tight_layout()
+        plt.savefig(os.path.join(RESULTS_DIR, f'qtable_heatmap_{inst_name}.png'), dpi=150)
+        plt.close()
+        print(f"  Saved: qtable_heatmap_{inst_name}.png")
+
+
+def plot_generalization_bar(gen_results):
+    """E5: Bar chart — pretrained vs fresh agent gap on test instances."""
+    fig, ax = plt.subplots(figsize=(8, 5))
+    x = np.arange(len(TEST_INSTANCES))
+    width = 0.35
+    pre_means = [np.mean(gen_results[t]['pretrained']) for t in TEST_INSTANCES]
+    pre_stds  = [np.std(gen_results[t]['pretrained'])  for t in TEST_INSTANCES]
+    fresh_means = [np.mean(gen_results[t]['fresh']) for t in TEST_INSTANCES]
+    fresh_stds  = [np.std(gen_results[t]['fresh'])  for t in TEST_INSTANCES]
+
+    ax.bar(x - width/2, pre_means, width, yerr=pre_stds,
+           label='Pre-trained (eil51+berlin52)', color='#4472C4',
+           capsize=5, edgecolor='black', linewidth=0.5)
+    ax.bar(x + width/2, fresh_means, width, yerr=fresh_stds,
+           label='Fresh Q-Learning', color='#ED7D31',
+           capsize=5, edgecolor='black', linewidth=0.5)
+
+    ax.set_xticks(x)
+    ax.set_xticklabels(TEST_INSTANCES)
+    ax.set_xlabel('Test Instance', fontsize=12)
+    ax.set_ylabel('Avg Gap to Optimal (%)', fontsize=12)
+    ax.set_title('Generalization: Pre-trained vs Fresh Q-Learning',
+                 fontsize=13, fontweight='bold')
+    ax.legend(fontsize=10)
+    ax.grid(True, alpha=0.3, axis='y')
+    plt.tight_layout()
+    plt.savefig(os.path.join(RESULTS_DIR, 'generalization_bar.png'), dpi=150)
+    plt.close()
+    print(f"  Saved: generalization_bar.png")
 
 
 # ============================================================
@@ -548,23 +710,30 @@ if __name__ == '__main__':
     print(f"Test instances: {TEST_INSTANCES}")
 
     # Run experiments
-    all_results = run_main_comparison()
-    reward_results = run_reward_comparison()
+    all_results   = run_main_comparison()
+    reward_results  = run_reward_comparison()
     epsilon_results = run_epsilon_comparison()
-    run_generalization_test(all_results)
+    gen_results     = run_generalization_test(all_results)   # M5: now returns data
 
     # Generate all visualizations
     print("\n" + "=" * 70)
     print("GENERATING VISUALIZATIONS")
     print("=" * 70)
 
+    # Original plots
     plot_convergence(all_results)
-    plot_transition_heatmap(all_results)
+    plot_transition_heatmap(all_results)          # includes E4 synergy printout
     plot_reward_comparison(reward_results)
     plot_epsilon_comparison(epsilon_results)
     plot_best_tour(all_results)
     plot_operator_distribution(all_results)
     plot_summary_table(all_results)
+
+    # New plots (E1, E2, E3, E5)
+    plot_reward_bar_comparison(reward_results)    # E1
+    plot_epsilon_restart_bar(epsilon_results)     # E2
+    plot_qtable_heatmap(all_results)              # E3
+    plot_generalization_bar(gen_results)          # E5
 
     elapsed = time.time() - start_time
     print(f"\n{'=' * 70}")
