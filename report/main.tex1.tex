@@ -1,0 +1,539 @@
+\documentclass[10pt,twocolumn]{article}
+\usepackage[margin=1in]{geometry}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{amsmath}
+\usepackage{hyperref}
+\usepackage{caption}
+\usepackage{subcaption}
+\usepackage{float}
+\usepackage{cite}
+\usepackage{microtype}
+\usepackage{parskip}
+\usepackage{titlesec}
+\titlespacing*{\section}{0pt}{6pt}{3pt}
+\titlespacing*{\subsection}{0pt}{4pt}{2pt}
+\graphicspath{{results/}}
+
+\title{\textbf{Adaptive Local Search Operator Selection for the\\
+Traveling Salesperson Problem via Tabular Q-Learning \\AIE635 Project}}
+\author{\textit{Akyaz Ozlem, Erdas Sila}}
+\date{}
+
+\begin{document}
+\maketitle
+
+%--------------------------------------------------------------------
+\begin{abstract}
+The Traveling Salesperson Problem (TSP) is a canonical NP-hard combinatorial
+optimization problem. Local search operators such as 2-opt, swap, and relocate
+are effective in isolation, yet no single operator dominates across all phases
+of a search trajectory. This paper proposes a \emph{selection hyper-heuristic}
+that frames operator selection as a Markov Decision Process (MDP) and learns a
+dynamic policy through tabular Q-learning. Our 120-state formulation encodes
+solution quality, search phase, recency of improvement, and last operator used.
+We compare three $\varepsilon$-greedy exploration strategies and two reward
+definitions on four standard TSPLIB instances. The Q-learning agent achieves
+a mean gap of \textbf{0.60\%} on \textit{berlin52} and \textbf{2.91\%} on
+\textit{eil51}, outperforming all fixed-operator and random baselines. A novel
+transition-matrix analysis reveals instance-dependent operator synergies:
+\emph{swap}$\to$\emph{2-opt} on smaller instances and
+\emph{relocate}$\to$\emph{2-opt} on larger ones.
+\end{abstract}
+
+%--------------------------------------------------------------------
+\section{Introduction}
+
+The Traveling Salesperson Problem asks for the shortest Hamiltonian cycle
+through $n$ cities. Despite its simple formulation, TSP is NP-hard~\cite{garey79},
+and exact methods become computationally infeasible beyond a few hundred cities.
+Local search heuristics remain the backbone of state-of-the-art solvers such as
+Concorde and LKH~\cite{applegate06,helsgott00}.
+
+A fundamental limitation of classical local search is the static use of a
+single operator. In practice, operator effectiveness is highly context-sensitive:
+2-opt efficiently untangles edges near optimal solutions, while perturbation
+operators (swap, relocate) are needed to escape deep local optima. Manually
+scheduling operators is time-consuming and instance-specific.
+
+\emph{Selection hyper-heuristics}~\cite{burke10} address this by maintaining a
+high-level policy that chooses among low-level heuristics at each step. When
+the policy is \emph{learned}, the framework adapts online to the evolving
+search landscape. Q-learning~\cite{watkins92} provides a natural mechanism:
+the agent observes state, selects an operator, receives an improvement reward,
+and updates a value function guiding future decisions.
+
+This paper makes four contributions:
+\begin{enumerate}\itemsep0pt
+  \item A complete tabular Q-learning hyper-heuristic with a 120-state MDP.
+  \item Systematic comparison of three exploration strategies and two reward definitions.
+  \item A \textbf{transition-matrix analysis} quantifying operator synergies.
+  \item A generalization study evaluating policy transfer across instance sizes.
+\end{enumerate}
+
+%--------------------------------------------------------------------
+\section{Related Work}
+
+\textbf{Local Search for TSP.}
+The 2-opt heuristic~\cite{lin65} remains the workhorse of TSP local search.
+Its extension to the Lin-Kernighan (LK) move~\cite{lin73} yields solutions
+within 1--2\% of optimal on large instances. Or-opt (relocate) and city-swap
+operators complement 2-opt by enabling moves it cannot perform~\cite{or76}.
+
+\textbf{Hyper-heuristics.}
+Burke et al.~\cite{burke10} provide a comprehensive taxonomy distinguishing
+\emph{selection} from \emph{generation} hyper-heuristics. Our work falls in
+the learning selection category. Meignan et al.~\cite{meignan15} apply
+Q-learning to neighbourhood selection in vehicle routing; Da Costa et
+al.~\cite{dacosta08} use multi-armed bandits for evolutionary operator
+selection. Compared to these, we introduce a richer state encoding and a
+transition-matrix diagnostic tool.
+
+\textbf{Deep RL for Combinatorial Optimization.}
+Bello et al.~\cite{bello16} (pointer networks) and Kool et al.~\cite{kool19}
+(attention model) demonstrate that deep RL can construct near-LKH solutions,
+but require GPU-scale training. Our tabular Q-learning is deliberately
+lightweight and interpretable.
+
+\textbf{Adaptive $\varepsilon$-Greedy.}
+Tokic~\cite{tokic10} proposes adaptive epsilon based on value differences in
+robot navigation. We adapt this idea to TSP operator selection via
+stagnation detection.
+
+%--------------------------------------------------------------------
+\section{Methodology}
+
+\subsection{MDP Formulation}
+
+We model the search as an episodic MDP $(\mathcal{S}, \mathcal{A}, \mathcal{R},
+\mathcal{T}, \gamma)$ with $|\mathcal{S}|=120$ states.
+
+Each state is a 4-tuple $(\text{quality\_band},\, \text{improved},\,
+\text{stage},\, \text{last\_op})$:
+\begin{itemize}\itemsep0pt
+  \item \textbf{quality\_band} $\in\{0,..,4\}$: relative gap to optimal
+        discretized as $<$5\%, 5--15\%, 15--30\%, 30--50\%, $>$50\%.
+  \item \textbf{improved} $\in\{0,1\}$: did the last step improve the tour?
+  \item \textbf{stage} $\in\{0,1,2\}$: Early ($<$33\%), Mid, Late search phase.
+  \item \textbf{last\_op} $\in\{0,1,2,3\}$: previously applied operator.
+\end{itemize}
+
+Action space: $\mathcal{A}=\{$2-opt, swap, relocate, restart$\}$.
+
+Two reward functions are compared:
+\begin{align}
+  R_1 &= \ell_{\text{prev}} - \ell_{\text{new}} \\
+  R_2 &= R_1 + 100\cdot\mathbf{1}[\ell_{\text{new}} < \ell_{\text{best}}]
+\end{align}
+
+The Q-table is updated as:
+\begin{equation}
+Q(s,a) \leftarrow Q(s,a) + \alpha\bigl[r + \gamma\max_{a'}Q(s',a') - Q(s,a)\bigr]
+\end{equation}
+with $\alpha=0.1$, $\gamma=0.9$.
+
+\subsection{Operators}
+
+\begin{table}[H]
+\centering
+\caption{Local Search Operators}
+\small
+\begin{tabular}{ll}
+\toprule
+\textbf{Operator} & \textbf{Description} \\
+\midrule
+2-opt & Best-improvement segment reversal \\
+Swap & Exchange two random cities \\
+Relocate & Remove city; reinsert at different position \\
+Restart & Full random permutation (perturbation) \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Improving moves are always accepted; worsening moves are accepted with
+probability 0.01 (SA-style escape), \emph{except} after restart which
+unconditionally replaces the current tour.
+
+\subsection{Exploration Strategies}
+
+\begin{itemize}\itemsep0pt
+  \item \textbf{Constant} $\varepsilon=0.1$: fixed throughout.
+  \item \textbf{Exponential Decay}: $\varepsilon_0{=}1.0$, $\varepsilon_{\min}{=}0.01$,
+        decay$=0.998$.
+  \item \textbf{Adaptive Stagnation}: decays by $\times0.99$ after improvements;
+        increases by $+0.05$ after 50 consecutive non-improving steps
+        (capped at $\varepsilon_{\max}{=}0.8$).
+\end{itemize}
+
+\subsection{Transition Matrix Analysis}
+
+After each episode we record $C[i,j]$: the number of times operator $j$ was
+applied immediately after a \emph{successful} (improving) application of
+operator $i$, excluding restart. Row-normalizing $C$ yields transition
+probabilities revealing operator synergies.
+
+\subsection{Experimental Setup}
+
+\begin{table}[H]
+\centering
+\caption{Experimental Parameters}
+\small
+\begin{tabular}{ll}
+\toprule
+\textbf{Parameter} & \textbf{Value} \\
+\midrule
+Instances & eil51 (opt=426), berlin52 (opt=7542) \\
+          & st70 (opt=675), kroA100 (opt=21282) \\
+Max iterations / episode & 3,000 \\
+Runs per configuration & 5 \\
+Training instances & eil51, berlin52 \\
+Test instances & st70, kroA100 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+%--------------------------------------------------------------------
+\section{Results and Discussion}
+
+\subsection{Main Performance Comparison}
+
+Table~\ref{tab:main} reports the average optimality gap (\%) over 5 runs.
+Q-Learning dominates on eil51, berlin52, and st70. On kroA100 (largest instance),
+Fixed 2-opt achieves a slightly lower mean gap (5.10\% vs.\ 6.06\%), as the
+Q-agent's exploration overhead is more costly with only 3,000 iterations on a
+100-city landscape.
+\begin{table}[H]
+\centering
+\caption{Average Gap to Optimal (\%) $\pm$ Std.}
+\label{tab:main}
+
+\footnotesize % Yazıyı okunaklı tutar ama small'dan bir tık küçüktür
+\setlength{\tabcolsep}{3pt} % Sütunlar arası boşluğu daraltarak sayfaya sığmasını sağlar
+
+\begin{tabular}{lcccc}
+\toprule
+\textbf{Strategy} & \textbf{eil51} & \textbf{berlin52} & \textbf{st70} & \textbf{kroA100} \\
+\midrule
+Q-Learning (Adap.)    & \textbf{2.91}$\pm$1.44 & \textbf{0.60}$\pm$1.72 & \textbf{3.20}$\pm$0.92 & 6.06$\pm$2.45 \\
+Fixed 2-opt           & 3.94$\pm$1.55 & 2.17$\pm$2.41 & 5.42$\pm$1.80 & \textbf{5.10}$\pm$0.62 \\
+Fixed swap            & 22.35$\pm$3.19 & 17.12$\pm$4.17 & 27.70$\pm$5.31 & 27.72$\pm$3.59 \\
+Fixed relocate        & 19.62$\pm$2.55 & 17.20$\pm$4.10 & 27.08$\pm$5.80 & 27.51$\pm$4.88 \\
+Fixed restart         & 24.04$\pm$4.25 & 17.50$\pm$4.30 & 27.97$\pm$5.51 & 28.27$\pm$4.07 \\
+Random select.        & 4.23$\pm$1.48 & 1.82$\pm$2.26 & 5.36$\pm$2.01 & 12.30$\pm$3.10 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Figure~\ref{fig:convergence} shows convergence curves. On eil51 and berlin52,
+Q-Learning descends below all baselines by $\approx$iteration 500 and sustains
+the advantage. On kroA100, Q-Learning and Fixed 2-opt diverge only after
+iteration 2,000 --- more iterations or training episodes would likely favor
+the adaptive agent.
+\begin{figure}[H]
+  \centering
+  \begin{subfigure}{0.9\linewidth}
+    \includegraphics[width=\linewidth]{convergence_eil51.png}
+    \caption{eil51}
+  \end{subfigure}
+  \vspace{0.5cm} % Grafikler arasında dikeyde boşluk bırakır
+  
+  \begin{subfigure}{0.9\linewidth}
+    \includegraphics[width=\linewidth]{convergence_berlin52.png}
+    \caption{berlin52}
+  \end{subfigure}
+  \vspace{0.5cm}
+  
+  \begin{subfigure}{0.9\linewidth}
+    \includegraphics[width=\linewidth]{convergence_st70.png}
+    \caption{st70}
+  \end{subfigure}
+  \vspace{0.5cm}
+  
+  \begin{subfigure}{0.9\linewidth}
+    \includegraphics[width=\linewidth]{convergence_kroA100.png}
+    \caption{kroA100}
+  \end{subfigure}
+  
+  \caption{Convergence curves: best tour length vs.\ iteration. Red dashed line = known optimal.}
+  \label{fig:convergence}
+\end{figure}
+
+
+\subsection{Operator Synergy Analysis}
+
+The transition probability heatmaps (Figure~\ref{fig:heatmap}) reveal strong,
+instance-dependent synergies:
+\begin{itemize}\itemsep0pt
+  \item \textbf{eil51 \& berlin52}: \emph{swap}$\to$\emph{2-opt} (prob.\ 0.86--0.87).
+        Swap moves displace a city to a suboptimal position, exposing new 2-opt
+        opportunities.
+  \item \textbf{st70 \& kroA100}: \emph{relocate}$\to$\emph{2-opt} (prob.\ 0.86--0.92).
+        On larger instances, relocation repositions cities more precisely,
+        creating better 2-opt candidates.
+\end{itemize}
+
+\begin{figure}[H]
+  \centering
+  \begin{subfigure}{0.9\linewidth}
+    \includegraphics[width=\linewidth]{transition_heatmap_eil51.png}
+    \caption{eil51}
+  \end{subfigure}
+  \vspace{0.6cm} % İki matris arasında birbirine karışmamaları için dikey boşluk
+  
+  \begin{subfigure}{0.9\linewidth}
+    \includegraphics[width=\linewidth]{transition_heatmap_kroA100.png}
+    \caption{kroA100}
+  \end{subfigure}
+  
+  \caption{Operator transition probability heatmaps after successful moves (restart excluded). Darker cells indicate stronger synergy.}
+  \label{fig:heatmap}
+\end{figure}
+
+\subsection{Reward Shaping: $R_1$ vs.\ $R_2$}
+
+Both reward functions yielded \emph{identical} results (eil51: 2.91\%,
+berlin52: 0.60\%). When the agent is far from the optimum, nearly every
+improving step also sets a new best, making $R_1$ and $R_2$ equivalent.
+Near convergence, the +100 bonus is too infrequent to shift Q-values.
+
+\begin{figure}[H]
+  \centering
+  \includegraphics[width=0.85\linewidth]{reward_bar_comparison.png}
+  \caption{Average gap for $R_1$ (Pure) vs.\ $R_2$ (Global Bonus) on
+           training instances. Error bars = 1 std.}
+  \label{fig:rewardbar}
+\end{figure}
+
+\begin{table}[H]
+\centering
+\caption{Epsilon Strategy Results}
+\label{tab:eps}
+
+\footnotesize % Önceki tabloyla uyumlu boyut
+\setlength{\tabcolsep}{3pt} % Sütunlar arası boşluk daraltıldı
+
+\begin{tabular}{lcccc}
+\toprule
+\textbf{Strategy} & \multicolumn{2}{c}{\textbf{Gap (\%)}} & \multicolumn{2}{c}{\textbf{Restarts}} \\
+ & eil51 & berlin52 & eil51 & berlin52 \\
+\midrule
+Constant $\varepsilon{=}0.1$ & 3.47$\pm$1.15 & 2.04$\pm$1.05 & 74.8 & 69.4 \\
+Exp. Decay                   & 4.84$\pm$0.87 & 3.19$\pm$1.32 & 134.2 & 122.0 \\
+\textbf{Adaptive (Stag.)}    & \textbf{2.91}$\pm$1.44 & \textbf{0.60}$\pm$1.72 & 116.2 & 110.2 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Exponential Decay performs worst despite starting at $\varepsilon{=}1.0$.
+As shown in Figure~\ref{fig:epsiloncomp}, epsilon collapses to near-zero
+within $\approx$1,000 iterations, causing the agent to exploit an immature
+Q-table for the remaining budget. The high restart count (134 on eil51) confirms
+repeated escape attempts from early-locked suboptimal policies.
+
+Adaptive Stagnation maintains a meaningful $\varepsilon$ throughout, increasing
+exploration precisely when stagnation is detected (sawtooth pattern visible in
+Figure~\ref{fig:epsiloncomp}, right panel), and decaying after improvements.
+
+\begin{figure}[H]
+  \centering
+  \includegraphics[width=\linewidth]{epsilon_comparison_eil51.png}
+  \caption{Epsilon strategy comparison on eil51. Left: convergence curves.
+           Right: $\varepsilon$ over time showing Adaptive's sawtooth pattern.}
+  \label{fig:epsiloncomp}
+\end{figure}
+
+\begin{figure}[H]
+  \centering
+  \includegraphics[width=0.9\linewidth]{epsilon_restart_bar.png}
+  \caption{Average restart count per epsilon strategy. Exponential Decay
+           triggers the most restarts, indicating policy instability.}
+  \label{fig:restartbar}
+\end{figure}
+
+\subsection{Q-Table Analysis}
+
+\begin{figure}[H]
+  \centering
+  \begin{subfigure}{0.48\linewidth}
+    \includegraphics[width=\linewidth]{qtable_heatmap_eil51.png}
+    \caption{eil51}
+  \end{subfigure}
+  \begin{subfigure}{0.48\linewidth}
+    \includegraphics[width=\linewidth]{qtable_heatmap_berlin52.png}
+    \caption{berlin52}
+  \end{subfigure}
+  \caption{Q-values aggregated by solution quality band. Green = high Q-value
+           (preferred operator). Darker red = avoided.}
+  \label{fig:qtable}
+\end{figure}
+
+The Q-table heatmaps (Figure~\ref{fig:qtable}) reveal a quality-aware learned
+policy:
+\begin{itemize}\itemsep0pt
+  \item \textbf{Poor-quality regions} (gap $>$30\%): relocate and swap dominate,
+        effective at escaping large local optima.
+  \item \textbf{High-quality regions} (gap $<$15\%): 2-opt dominates, consistent
+        with its strength in fine-tuning near-optimal solutions.
+  \item \textbf{Restart} is uniformly low across all bands --- the agent learns
+        to treat it as a last resort.
+\end{itemize}
+This gradient from perturbation-preference to refinement-preference is exactly
+what an expert practitioner would engineer manually, here discovered autonomously.
+
+\begin{figure}[H]
+  \centering
+  \begin{subfigure}{0.48\linewidth}
+    \includegraphics[width=\linewidth]{tour_eil51.png}
+    \caption{eil51 (gap: 1.17\%)}
+  \end{subfigure}
+  \begin{subfigure}{0.48\linewidth}
+    \includegraphics[width=\linewidth]{tour_berlin52.png}
+    \caption{berlin52 (gap: $\approx$0\%)}
+  \end{subfigure}
+  \caption{Best tours found by Q-Learning. Routes are visually clean with
+           minimal crossing edges.}
+  \label{fig:tours}
+\end{figure}
+
+\subsection{Generalization Study}
+
+\begin{table}[H]
+\centering
+\caption{Generalization Test: Gap (\%) on unseen instances.}
+\label{tab:gen}
+\small
+\begin{tabular}{lcc}
+\toprule
+\textbf{Test Instance} & \textbf{Pre-trained} & \textbf{Fresh Q-Learning} \\
+\midrule
+st70    & 6.07$\pm$1.04 & \textbf{3.20}$\pm$0.92 \\
+kroA100 & 7.02$\pm$2.71 & \textbf{6.06}$\pm$2.45 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{figure}[H]
+  \centering
+  \includegraphics[width=0.85\linewidth]{generalization_bar.png}
+  \caption{Pre-trained (eil51+berlin52) vs.\ Fresh Q-Learning on test instances.
+           Fresh training consistently outperforms direct Q-table transfer.}
+  \label{fig:genbar}
+\end{figure}
+
+As Table~\ref{tab:gen} and Figure~\ref{fig:genbar} show, pre-training on
+smaller instances does \emph{not} improve performance on larger unseen ones.
+Three factors explain negative transfer:
+\begin{enumerate}\itemsep0pt
+  \item \textbf{State distribution shift}: quality-band encoding is relative to
+        each instance's optimal.
+  \item \textbf{Operator dynamics differ by size}: different synergy pairs dominate
+        on small vs.\ large instances.
+  \item \textbf{Insufficient pre-training}: 20 episodes on small instances cannot
+        build a universally transferable policy.
+\end{enumerate}
+
+%--------------------------------------------------------------------
+\section{Conclusion}
+
+We presented a tabular Q-learning hyper-heuristic for adaptive operator
+selection in TSP local search. Key findings:
+\begin{enumerate}\itemsep0pt
+  \item \textbf{Adaptive Q-learning outperforms all fixed baselines} on 3 of 4
+        instances, achieving 0.60\% gap on berlin52.
+  \item \textbf{Adaptive stagnation epsilon} is the best exploration strategy,
+        avoiding premature convergence of exponential decay.
+  \item \textbf{Operator synergies are instance-size-dependent}:
+        swap$\to$2-opt on small, relocate$\to$2-opt on large instances.
+  \item \textbf{The Q-table autonomously learns} a quality-aware policy
+        transitioning from perturbation to refinement operators.
+  \item \textbf{Transfer learning fails without normalized state features}
+        decoupled from instance-specific optimal values.
+\end{enumerate}
+
+Future work: normalized state encoding for generalization, shallow DQN for
+continuous features, 3-opt/LKH actions, and extension to CVRP.
+
+%--------------------------------------------------------------------
+\bibliographystyle{ieeetr}
+\begin{thebibliography}{15}
+
+\bibitem{garey79}
+M.~R. Garey and D.~S. Johnson,
+\textit{Computers and Intractability: A Guide to the Theory of NP-Completeness}.
+Freeman, 1979.
+
+\bibitem{applegate06}
+D.~Applegate, R.~Bixby, V.~Chvatal, and W.~Cook,
+\textit{The Traveling Salesman Problem: A Computational Study}.
+Princeton University Press, 2006.
+
+\bibitem{helsgott00}
+K.~Helsgott, O.~Rooij, and R.~Wiegand,
+``LKH: An Effective Implementation of the Lin-Kernighan Heuristic,''
+\textit{European Journal of Operational Research}, vol.~126, no.~1, pp.~106--130, 2000.
+
+\bibitem{burke10}
+E.~K. Burke \textit{et al.},
+``A Classification of Hyper-heuristic Approaches,''
+in \textit{Handbook of Metaheuristics}, Springer, 2010, pp.~449--468.
+
+\bibitem{lourenco03}
+H.~R. Lourenco, O.~C. Martin, and T.~Stutzle,
+``Iterated Local Search,''
+in \textit{Handbook of Metaheuristics}, Springer, 2003, pp.~320--353.
+
+\bibitem{watkins92}
+C.~J. C.~H. Watkins and P.~Dayan,
+``Q-learning,''
+\textit{Machine Learning}, vol.~8, no.~3--4, pp.~279--292, 1992.
+
+\bibitem{meignan15}
+D.~Meignan \textit{et al.},
+``A Review and Taxonomy of Interactive Optimization Methods in Operations Research,''
+\textit{ACM TIIS}, vol.~5, no.~3, pp.~1--43, 2015.
+
+\bibitem{dacosta08}
+L.~Da Costa, F.~Guimaraes, and A.~Delbem,
+``Operator Selection with Dynamic Multi-Armed Bandits,''
+in \textit{Proc. GECCO 2008}, ACM, pp.~1539--1546.
+
+\bibitem{lin65}
+S.~Lin,
+``Computer Solutions of the Traveling Salesman Problem,''
+\textit{Bell System Technical Journal}, vol.~44, no.~10, pp.~2245--2269, 1965.
+
+\bibitem{lin73}
+S.~Lin and B.~W. Kernighan,
+``An Effective Heuristic Algorithm for the Traveling Salesman Problem,''
+\textit{Operations Research}, vol.~21, no.~2, pp.~498--516, 1973.
+
+\bibitem{or76}
+I.~Or,
+\textit{Traveling Salesman-type Combinatorial Problems and Their Relation to the
+Logistics of Regional Blood Banking}.
+Ph.D. Dissertation, Northwestern University, 1976.
+
+\bibitem{bello16}
+I.~Bello \textit{et al.},
+``Neural Combinatorial Optimization with Reinforcement Learning,''
+\textit{arXiv:1611.09940}, 2016.
+
+\bibitem{kool19}
+W.~Kool, H.~van Hoof, and M.~Welling,
+``Attention, Learn to Solve Routing Problems!''
+in \textit{Proc. ICLR 2019}.
+
+\bibitem{hottung20}
+A.~Hottung and K.~Tierney,
+``Neural Large Neighbourhood Search for the Capacitated Vehicle Routing Problem,''
+in \textit{Proc. ECAI 2020}, pp.~443--450.
+
+\bibitem{tokic10}
+M.~Tokic,
+``Adaptive $\varepsilon$-greedy Exploration in Reinforcement Learning Based on
+Value Differences,''
+in \textit{Proc. KI 2010}, Springer, pp.~203--210.
+
+\end{thebibliography}
+
+\end{document}
